@@ -1,0 +1,22 @@
+# Secrets — jamais sur Git, même dans un dépôt privé
+.env
+
+# Données volumineuses, régénérables en relançant le pipeline
+Gold_Data/
+New_radio/
+PatientRadios/
+
+# Poids de modèles (entraînés ou pré-entraînés) — lourds, régénérables/téléchargeables
+*.pth
+*.pt
+
+# Sorties d'entraînement YOLOv8, générées automatiquement
+runs/
+
+# Cache Python
+__pycache__/
+*.pyc
+
+# Environnement virtuel Python, si tu en utilises un
+venv/
+.venv/
