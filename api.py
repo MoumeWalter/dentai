@@ -11,6 +11,9 @@ from PIL import Image
 from dotenv import load_dotenv
 from pydantic import BaseModel
 from datetime import date
+import base64
+from ultralytics import YOLO
+import tempfile
 
 load_dotenv()
 
@@ -55,46 +58,45 @@ cursor = conn.cursor()
 # Variable globale qui contiendra le modèle ResNet18 chargé une seule fois.
 # Un appel à /diagnostic réutilise toujours ce même objet en mémoire,
 # évitant de recharger les poids (plusieurs secondes) à chaque requête.
+# Variables globales pour les deux modèles
 CLASSES = ['caries', 'fractured_teeth', 'healthy_teeth', 'impacted_teeth', 'infection']
 modele = None
 transformation = None
+modele_detection = None
 
 @app.on_event("startup")
 def charger_modele():
     """
-    Déclenché automatiquement par FastAPI au lancement de l'API (uvicorn).
-    Charge ResNet18 avec les poids entraînés (best_model.pth) et
-    configure le pipeline de transformation d'image.
+    Chargement unique au démarrage de l'API des deux modèles IA :
+    - ResNet18 pour la classification (pathologie présente ?)
+    - YOLOv8 pour la détection (où se trouve la pathologie ?)
     """
-    global modele, transformation
+    global modele, transformation, modele_detection
 
-    # Architecture identique à celle définie dans model_classification.py :
-    # 1 canal d'entrée (niveaux de gris), 5 classes en sortie, Dropout 0.5
+    # --- ResNet18 (classification) ---
     m = models.resnet18()
     m.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
     m.fc = nn.Sequential(
         nn.Dropout(0.5),
         nn.Linear(m.fc.in_features, len(CLASSES))
     )
-
-    # Chargement des poids sauvegardés lors du meilleur epoch d'entraînement
     m.load_state_dict(torch.load("best_model.pth", map_location="cpu"))
-
-    # Mode évaluation : désactive le Dropout pour des prédictions stables
     m.eval()
     modele = m
 
-    # Pipeline de transformation identique à celui utilisé à l'entraînement
-    # (même normalisation, même taille) pour que les images soient présentées
-    # au modèle dans le même format qu'il a appris à reconnaître
     transformation = transforms.Compose([
         transforms.Grayscale(num_output_channels=1),
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5], std=[0.5])
     ])
-    print("Modèle ResNet18 chargé avec succès.")
 
+    # --- YOLOv8 (détection) ---
+    modele_detection = YOLO(
+        "runs/detect/dentai_detection_v2/weights/best.pt"
+    )
+
+    print("Modèles ResNet18 et YOLOv8 chargés avec succès.")
 
 def appliquer_clahe(image_gray: np.ndarray) -> np.ndarray:
     """
@@ -234,4 +236,62 @@ async def diagnostic(
         "pathologie": pathologie_predite,
         "score_confiance": round(score_confiance, 2),
         "message": "Diagnostic effectué avec succès"
+    }
+
+@app.post("/diagnostic/detection")
+async def diagnostic_detection(
+    radio: UploadFile = File(...)
+):
+    """
+    Reçoit une image radio, applique YOLOv8 pour détecter et localiser
+    les pathologies dentaires, et retourne l'image annotée avec les
+    bounding boxes dessinées dessus, encodée en base64.
+
+    Note : les performances de ce modèle sont limitées (mAP50 = 0.0025)
+    faute de données d'entraînement suffisantes — documenté au Bloc 4.
+    L'endpoint est fonctionnel et illustre le principe de la détection
+    d'objets, mais les prédictions ne sont pas cliniquement fiables.
+    """
+    # 1. Lire et sauvegarder temporairement l'image
+    # YOLOv8 travaille sur des fichiers plutôt que sur des bytes en mémoire
+    contenu = await radio.read()
+    chemin_temp = os.path.join(tempfile.gettempdir(), "radio_temp.jpg")
+    with open(chemin_temp, "wb") as f:
+        f.write(contenu)
+
+    # 2. Inférence YOLOv8 — retourne une liste de résultats
+    # imgsz=640 correspond à la taille utilisée lors de l'entraînement v2
+    resultats = modele_detection(chemin_temp, imgsz=640, conf=0.01)
+
+    # 3. Générer l'image annotée avec les bounding boxes dessinées
+    # conf=0.01 (seuil très bas) pour maximiser les détections visibles
+    # même avec un modèle peu performant, pour la démo
+    chemin_annotee = os.path.join(tempfile.gettempdir(), "radio_annotee.jpg")
+    resultats[0].save(filename=chemin_annotee)
+
+    # 4. Lire l'image annotée et l'encoder en base64
+    # Base64 permet d'envoyer une image dans une réponse JSON,
+    # sans avoir besoin d'un endpoint de fichier séparé
+    with open(chemin_annotee, "rb") as f:
+        image_base64 = base64.b64encode(f.read()).decode("utf-8")
+
+    # 5. Récupérer les détections pour les afficher aussi en texte
+    detections = []
+    for box in resultats[0].boxes:
+        classe_id = int(box.cls[0])
+        classe_nom = modele_detection.names[classe_id]
+        confiance = float(box.conf[0])
+        detections.append({
+            "classe": classe_nom,
+            "confiance": round(confiance, 3)
+        })
+
+    return {
+        "image_annotee_base64": image_base64,
+        "detections": detections,
+        "nb_detections": len(detections),
+        "message": (
+            "Détection effectuée. Note : performances limitées "
+            "(mAP50=0.0025) — voir Bloc 4 pour le diagnostic complet."
+        )
     }

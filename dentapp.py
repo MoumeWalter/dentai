@@ -1,9 +1,13 @@
 import streamlit as st
 import requests
 import streamlit_authenticator as stauth
+import base64
+from io import BytesIO
+from PIL import Image as PILImage
 
 # -----------------------------------------------------------------------
 # CONFIGURATION DE LA PAGE
+# Doit être le premier appel Streamlit du script
 # -----------------------------------------------------------------------
 st.set_page_config(
     page_title="DentAPP",
@@ -125,7 +129,6 @@ if role == "secretaire":
         "Les radios et diagnostics sont réservés aux chirurgiens.",
         icon="ℹ️"
     )
-
     st.markdown("### Patients enregistrés")
     try:
         response = requests.get("http://127.0.0.1:8000/patients")
@@ -169,17 +172,18 @@ elif role == "chirurgien":
             use_container_width=True
         )
 
+        # Bouton de diagnostic — le résultat est stocké dans session_state
+        # plutôt que dans des variables locales, pour qu'il survive au
+        # rechargement Streamlit déclenché par le clic sur le bouton YOLOv8.
+        # Sans session_state, cliquer sur "Localiser" ferait oublier à
+        # Streamlit que le diagnostic avait déjà été lancé.
         if st.button("🔍 Lancer le diagnostic", type="primary"):
             with st.spinner("Analyse en cours..."):
                 try:
-                    # Rembobinage du pointeur de fichier avant lecture
-                    # (nécessaire si st.image l'a déjà lu)
                     radio_uploadee.seek(0)
                     fichier_bytes = radio_uploadee.read()
 
                     # Envoi multipart/form-data à l'API FastAPI
-                    # id_radio en Form, image en File — correspond exactement
-                    # à la signature de l'endpoint POST /diagnostic
                     response = requests.post(
                         "http://127.0.0.1:8000/diagnostic",
                         data={"id_radio": int(id_radio)},
@@ -192,71 +196,148 @@ elif role == "chirurgien":
                     resultat = response.json()
 
                     if response.status_code == 200:
-                        pathologie = resultat["pathologie"]
-                        score = resultat["score_confiance"]
-
-                        # Affichage du résultat
-                        st.success("✅ Diagnostic effectué avec succès")
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.metric(
-                                "Pathologie détectée",
-                                pathologie.replace("_", " ").title()
-                            )
-                        with col2:
-                            st.metric(
-                                "Score de confiance",
-                                f"{score * 100:.0f}%"
-                            )
-
-                        # Message culture data — Bloc 5
-                        # Affiché précisément au moment de la validation,
-                        # là où le comportement du praticien est déterminant
-                        # pour la qualité future du modèle
-                        st.info(
-                            "💡 **Votre validation compte.** En confirmant ou "
-                            "corrigeant ce diagnostic, vous contribuez à améliorer "
-                            "le modèle IA pour tous vos futurs patients. "
-                            "Merci de vérifier attentivement avant de valider.",
-                            icon="ℹ️"
-                        )
-
-                        # Validation ou correction par le chirurgien
-                        st.markdown("### Valider ou corriger le diagnostic")
-                        choix = st.radio(
-                            "Le diagnostic proposé est-il correct ?",
-                            ["✅ Confirmer", "✏️ Corriger"],
-                            horizontal=True
-                        )
-
-                        if choix == "✏️ Corriger":
-                            correction = st.selectbox(
-                                "Pathologie correcte selon votre examen clinique :",
-                                [
-                                    "caries",
-                                    "fractured_teeth",
-                                    "healthy_teeth",
-                                    "impacted_teeth",
-                                    "infection"
-                                ]
-                            )
-                            st.success(
-                                f"Correction enregistrée : **{correction}**"
-                            )
-                            # Note : l'écriture de la correction en base
-                            # nécessite un endpoint PUT /resultats/{id_resultat}
-                            # à ajouter dans api.py (itération future)
-
-                        elif choix == "✅ Confirmer":
-                            st.success(
-                                "Diagnostic confirmé et enregistré dans le dossier patient."
-                            )
-
+                        # Persistance du résultat ET des bytes de l'image
+                        # dans session_state pour le bouton YOLOv8
+                        st.session_state["dernier_diagnostic"] = resultat
+                        radio_uploadee.seek(0)
+                        st.session_state["derniere_radio"] = radio_uploadee.read()
+                        st.session_state["dernier_nom_radio"] = radio_uploadee.name
                     else:
                         st.error(f"Erreur API ({response.status_code}) : {resultat}")
 
                 except Exception as e:
                     st.error(f"Erreur de connexion à l'API : {e}")
+
+        # ---------------------------------------------------------------
+        # AFFICHAGE DU RÉSULTAT — hors du bouton diagnostic
+        # Placé ici (pas dans le if st.button) pour persister après
+        # chaque interaction Streamlit ultérieure (clic YOLOv8, radio, etc.)
+        # ---------------------------------------------------------------
+        if "dernier_diagnostic" in st.session_state:
+            resultat = st.session_state["dernier_diagnostic"]
+            pathologie = resultat["pathologie"]
+            score = resultat["score_confiance"]
+
+            st.success("✅ Diagnostic effectué avec succès")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric(
+                    "Pathologie détectée",
+                    pathologie.replace("_", " ").title()
+                )
+            with col2:
+                st.metric(
+                    "Score de confiance",
+                    f"{score * 100:.0f}%"
+                )
+
+            # -----------------------------------------------------------
+            # DÉTECTION YOLOv8 — localisation des pathologies
+            # Modèle 2 du projet (Bloc 4), performances limitées documentées
+            # L'image retournée par l'API contient les bounding boxes
+            # dessinées par YOLOv8 sur la radio originale
+            # -----------------------------------------------------------
+            st.markdown("### 🔬 Localisation des pathologies (YOLOv8)")
+            st.caption(
+                "⚠️ Performances limitées (mAP50 = 0.0025 lors de l'entraînement) "
+                "— les bounding boxes sont indicatives, pas cliniquement fiables. "
+                "Voir Bloc 4 du rapport pour le détail des itérations."
+            )
+
+            if st.button("📍 Localiser les pathologies sur la radio"):
+                with st.spinner("Détection en cours..."):
+                    try:
+                        # Récupération des bytes de l'image depuis session_state
+                        # (l'image originale uploadée, pas le résultat annoté)
+                        fichier_bytes_yolo = st.session_state["derniere_radio"]
+                        nom_radio = st.session_state["dernier_nom_radio"]
+
+                        # Appel à l'endpoint de détection — retourne l'image
+                        # annotée encodée en base64 dans le JSON de réponse
+                        response_yolo = requests.post(
+                            "http://127.0.0.1:8000/diagnostic/detection",
+                            files={"radio": (
+                                nom_radio,
+                                fichier_bytes_yolo,
+                                "image/jpeg"
+                            )}
+                        )
+                        resultat_yolo = response_yolo.json()
+
+                        if response_yolo.status_code == 200:
+                            # Décodage base64 → PIL Image → affichage Streamlit
+                            img_bytes = base64.b64decode(
+                                resultat_yolo["image_annotee_base64"]
+                            )
+                            img_annotee = PILImage.open(BytesIO(img_bytes))
+                            st.image(
+                                img_annotee,
+                                caption="Radio avec détections YOLOv8",
+                                use_container_width=True
+                            )
+
+                            # Liste textuelle des détections
+                            if resultat_yolo["nb_detections"] > 0:
+                                st.write(
+                                    f"**{resultat_yolo['nb_detections']} "
+                                    f"détection(s) :**"
+                                )
+                                for d in resultat_yolo["detections"]:
+                                    st.write(
+                                        f"- {d['classe']} "
+                                        f"(confiance : {d['confiance']*100:.1f}%)"
+                                    )
+                            else:
+                                st.info(
+                                    "Aucune pathologie localisée sur cette radio "
+                                    "(seuil de confiance minimal appliqué : 0.01)."
+                                )
+
+                    except Exception as e:
+                        st.error(f"Erreur détection : {e}")
+
+            # -----------------------------------------------------------
+            # MESSAGE CULTURE DATA — Bloc 5
+            # Affiché au moment précis de la validation, là où le
+            # comportement du praticien est le plus déterminant pour
+            # la qualité future du modèle (voir section 5.6 du rapport)
+            # -----------------------------------------------------------
+            st.info(
+                "💡 **Votre validation compte.** En confirmant ou "
+                "corrigeant ce diagnostic, vous contribuez à améliorer "
+                "le modèle IA pour tous vos futurs patients. "
+                "Merci de vérifier attentivement avant de valider.",
+                icon="ℹ️"
+            )
+
+            # Validation ou correction par le chirurgien
+            st.markdown("### Valider ou corriger le diagnostic")
+            choix = st.radio(
+                "Le diagnostic proposé est-il correct ?",
+                ["✅ Confirmer", "✏️ Corriger"],
+                horizontal=True
+            )
+
+            if choix == "✏️ Corriger":
+                correction = st.selectbox(
+                    "Pathologie correcte selon votre examen clinique :",
+                    [
+                        "caries",
+                        "fractured_teeth",
+                        "healthy_teeth",
+                        "impacted_teeth",
+                        "infection"
+                    ]
+                )
+                st.success(f"Correction enregistrée : **{correction}**")
+                # Note : l'écriture de la correction en base nécessite
+                # un endpoint PUT /resultats/{id_resultat} à ajouter
+                # dans api.py (itération future)
+
+            elif choix == "✅ Confirmer":
+                st.success(
+                    "Diagnostic confirmé et enregistré dans le dossier patient."
+                )
 
 # -----------------------------------------------------------------------
 # VUE ADMINISTRATEUR
@@ -287,7 +368,10 @@ elif role == "admin":
 
         st.markdown("### Informations système")
         st.write("**Accuracy du modèle (jeu de test) :** 36%")
-        st.write("**Classes détectées :** caries, fractured_teeth, healthy_teeth, impacted_teeth, infection")
+        st.write(
+            "**Classes détectées :** caries, fractured_teeth, "
+            "healthy_teeth, impacted_teeth, infection"
+        )
         st.write("**Version de l'API :** DentAI API v2.0")
 
     except Exception as e:
